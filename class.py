@@ -1,8 +1,7 @@
 import csv
-import re
-from collections import defaultdict
-import math
-
+import ollama
+import chromadb
+from chromadb.config import Settings
 
 class BankingFAQChatbot:
     def __init__(self, csv_file='banking_faqs.csv'):
@@ -11,10 +10,21 @@ class BankingFAQChatbot:
         self.answers = []
         self.categories = []
         self.load_faqs(csv_file)
-        self.vocab = {}
-        self.idf = {}
-        self.question_vectors = []
-        self.build_tfidf_model()
+
+        # Initialize ChromaDB vector database
+        self.chroma_client = chromadb.Client(Settings(
+            anonymized_telemetry=False
+        ))
+
+        # Create or get collection
+        self.collection = self.chroma_client.get_or_create_collection(
+            name="banking_faqs",
+            metadata={"description": "Banking FAQ embeddings"}
+        )
+
+        # Build vector database
+        self.build_vector_database()
+
         self.confidence_threshold = 0.3
 
     def load_faqs(self, csv_file):
@@ -31,100 +41,73 @@ class BankingFAQChatbot:
             print("  Make sure banking_faqs.csv is in the same directory")
             exit(1)
 
-    def preprocess_text(self, text):
-        text = text.lower()
-        text = re.sub(r'[^\w\s]', ' ', text)
-        tokens = text.split()
-        stop_words = {'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves',
-                      'you', 'your', 'yours', 'yourself', 'yourselves', 'he', 'him',
-                      'his', 'himself', 'she', 'her', 'hers', 'herself', 'it', 'its',
-                      'itself', 'they', 'them', 'their', 'theirs', 'themselves', 'what',
-                      'which', 'who', 'whom', 'this', 'that', 'these', 'those', 'am',
-                      'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has',
-                      'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an', 'the',
-                      'and', 'but', 'if', 'or', 'because', 'as', 'until', 'while', 'of',
-                      'at', 'by', 'for', 'with', 'about', 'against', 'between', 'into',
-                      'through', 'during', 'before', 'after', 'above', 'below', 'to',
-                      'from', 'up', 'down', 'in', 'out', 'on', 'off', 'over', 'under',
-                      'again', 'further', 'then', 'once'}
-        tokens = [t for t in tokens if t not in stop_words and len(t) > 2]
-        return tokens
+    def build_vector_database(self):
+        """Build vector database using Ollama embeddings"""
+        print("🔧 Building vector database with Ollama embeddings...")
 
-    def compute_term_frequency(self, tokens):
-        tf = defaultdict(int)
-        for token in tokens:
-            tf[token] += 1
-        max_freq = max(tf.values()) if tf else 1
-        for token in tf:
-            tf[token] = tf[token] / max_freq
-        return dict(tf)
+        # Clear existing data
+        try:
+            self.chroma_client.delete_collection("banking_faqs")
+            self.collection = self.chroma_client.create_collection(
+                name="banking_faqs",
+                metadata={"description": "Banking FAQ embeddings"}
+            )
+        except:
+            pass
 
-    def build_tfidf_model(self):
-        tokenized_questions = [self.preprocess_text(q) for q in self.questions]
+        # Generate embeddings for all questions using Ollama
+        for idx, question in enumerate(self.questions):
+            # Get embedding from Ollama
+            response = ollama.embeddings(
+                model='llama2',
+                prompt=question
+            )
+            embedding = response['embedding']
 
-        doc_freq = defaultdict(int)
-        for tokens in tokenized_questions:
-            unique_tokens = set(tokens)
-            for token in unique_tokens:
-                doc_freq[token] += 1
-        self.vocab = {word: idx for idx, word in enumerate(doc_freq.keys())}
+            # Add to ChromaDB
+            self.collection.add(
+                embeddings=[embedding],
+                documents=[question],
+                metadatas=[{
+                    'answer': self.answers[idx],
+                    'category': self.categories[idx]
+                }],
+                ids=[f"faq_{idx}"]
+            )
 
-        num_docs = len(tokenized_questions)
-        for word in doc_freq:
-            self.idf[word] = math.log(num_docs / (1 + doc_freq[word]))
-
-        for tokens in tokenized_questions:
-            tf = self.compute_term_frequency(tokens)
-            vector = {}
-            for word, tf_value in tf.items():
-                if word in self.vocab:
-                    vector[self.vocab[word]] = tf_value * self.idf[word]
-            self.question_vectors.append(vector)
-
-    def vectorize_query(self, query):
-        tokens = self.preprocess_text(query)
-        tf = self.compute_term_frequency(tokens)
-
-        vector = {}
-        for word, tf_value in tf.items():
-            if word in self.vocab:
-                vector[self.vocab[word]] = tf_value * self.idf[word]
-        return vector
-
-    def cosine_similarity(self, vec1, vec2):
-
-        common_keys = set(vec1.keys()) & set(vec2.keys())
-
-        if not common_keys:
-            return 0.0
-
-        dot_product = sum(vec1[key] * vec2[key] for key in common_keys)
-        mag1 = math.sqrt(sum(val ** 2 for val in vec1.values()))
-        mag2 = math.sqrt(sum(val ** 2 for val in vec2.values()))
-
-        if mag1 == 0 or mag2 == 0:
-            return 0.0
-
-        return dot_product / (mag1 * mag2)
+        print(f"✓ Vector database built with {len(self.questions)} FAQs")
 
     def retrieve_similar_questions(self, query, top_k=3):
-        query_vector = self.vectorize_query(query)
-        similarities = []
-        for idx, faq_vector in enumerate(self.question_vectors):
-            similarity = self.cosine_similarity(query_vector, faq_vector)
-            similarities.append((idx, similarity))
+        """
+        RAG: Retrieve top-k most similar FAQ questions using vector database
+        """
+        # Generate embedding for the query using Ollama
+        response = ollama.embeddings(
+            model='llama2',
+            prompt=query
+        )
+        query_embedding = response['embedding']
 
-        similarities.sort(key=lambda x: x[1], reverse=True)
+        # Query ChromaDB for similar questions
+        results = self.collection.query(
+            query_embeddings=[query_embedding],
+            n_results=top_k
+        )
 
-        # Get top-k results
+        # Format results
         top_results = []
-        for idx, score in similarities[:top_k]:
+        for i in range(len(results['documents'][0])):
+            # Distance to similarity conversion (ChromaDB returns distances)
+            distance = results['distances'][0][i]
+            similarity = 1 / (1 + distance)  # Convert distance to similarity score
+
+            metadata = results['metadatas'][0][i]
             top_results.append({
-                'index': idx,
-                'score': score,
-                'question': self.questions[idx],
-                'answer': self.answers[idx],
-                'category': self.categories[idx]
+                'index': i,
+                'score': similarity,
+                'question': results['documents'][0][i],
+                'answer': metadata['answer'],
+                'category': metadata['category']
             })
 
         return top_results
@@ -133,6 +116,7 @@ class BankingFAQChatbot:
         best_match = top_results[0]
         confidence = best_match['score']
 
+        # Low confidence - show suggestions
         if confidence < self.confidence_threshold:
             print(f"\n❓ I'm not sure what you're asking about.")
             print(f"\n💡 Did you mean:")
@@ -141,13 +125,14 @@ class BankingFAQChatbot:
             print(f"\n📞 For more help, please call: 1-800-BANK-123")
             return None
 
+        # Medium confidence - show "did you mean"
         if confidence < 0.6:
             print(f"\n💡 Did you mean: \"{best_match['question']}\"?\n")
             print(f"{best_match['answer']}")
             return best_match['answer']
 
+        # High confidence - show direct answer
         print(f"\n{best_match['answer']}")
-
         return best_match['answer']
 
     def chat(self, query):
@@ -157,7 +142,6 @@ class BankingFAQChatbot:
 
 
 def display_banner():
-
     print("\n" + "=" * 80)
     print(" " * 20 + "🏦 BANKING FAQ CHATBOT 🏦")
     print("=" * 80)
@@ -171,11 +155,9 @@ def display_banner():
 
 
 def display_help(chatbot):
-
     print("\n" + "=" * 80)
     print("📖 AVAILABLE TOPICS")
     print("=" * 80)
-
 
     categories = {}
     for faq in chatbot.faqs:
@@ -193,16 +175,14 @@ def display_help(chatbot):
 
 
 def display_stats(chatbot):
-
     print("\n" + "=" * 80)
     print("📊 SYSTEM STATISTICS")
     print("=" * 80)
     print(f"\n✓ Total FAQs loaded: {len(chatbot.faqs)}")
-    print(f"✓ Vocabulary size: {len(chatbot.vocab)} unique words")
+    print(f"✓ Vector database: ChromaDB with Ollama embeddings")
     print(f"✓ Categories: {len(set(chatbot.categories))}")
     print(f"✓ Confidence threshold: {chatbot.confidence_threshold * 100}%")
     print(f"✓ RAG retrieval: Top 3 similar questions")
-
 
     category_counts = {}
     for cat in chatbot.categories:
@@ -214,35 +194,25 @@ def display_stats(chatbot):
 
 
 def main():
-
     display_banner()
-
-
     chatbot = BankingFAQChatbot('banking_faqs.csv')
-
     print("✅ Ready! Ask me anything.\n")
-
 
     while True:
         try:
-
             user_input = input("You: ").strip()
-
 
             if user_input.lower() in ['quit', 'exit', 'q', 'bye']:
                 print("\n👋 Thank you for using our banking chatbot! Have a great day!")
                 break
 
-
             if user_input.lower() in ['help', 'h', '?']:
                 display_help(chatbot)
                 continue
 
-
             if user_input.lower() in ['stats', 'statistics', 'info']:
                 display_stats(chatbot)
                 continue
-
 
             if not user_input:
                 continue
