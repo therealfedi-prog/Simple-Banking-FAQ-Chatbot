@@ -1,1 +1,2 @@
-A Python-based banking FAQ chatbot using RAG (Retrieval-Augmented Generation) with TF-IDF vectorization and cosine similarity to match user questions to predefined answers. Features intelligent "Did you mean?" suggestions for partial matches and confidence thresholds to ensure accurate responses without generating free text.
+you need to have the ollama(as you asked) module installed in your device in order for this code to work 
+and i used the vector data bases 
